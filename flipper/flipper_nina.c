@@ -66,6 +66,11 @@ typedef enum {
 #define UART_BAUD       115200
 #define LINE_MAX_LEN    192
 #define REFRESH_MS      500
+// Out of range if not heard from for this long, even if end-of-round markers were lost
+#define EXPIRE_MS 60000
+// Out-of-range non-favorites are dropped after this long (rotating BLE addresses pile up)
+#define FORGET_MS       300000
+#define RX_BUFFER_SIZE  2048
 #define LIST_ROWS       4
 #define LIST_TOP        13
 #define LIST_ROW_HEIGHT 12
@@ -117,6 +122,7 @@ typedef struct {
     uint8_t misses;
     int8_t rssi;
     uint8_t channel;
+    uint32_t last_seen;
     char address[18];
     // Advertised name for BLE, SSID for WiFi
     char name[33];
@@ -431,6 +437,28 @@ static void device_mark_seen(FlipperNinaApp* app, Device* d) {
     d->visible = true;
     d->seen = true;
     d->misses = 0;
+    d->last_seen = furi_get_tick();
+}
+
+// Rollover-safe since the tick math is unsigned. Returns true if anything changed.
+static bool devices_expire(FlipperNinaApp* app) {
+    uint32_t now = furi_get_tick();
+    bool changed = false;
+    for(uint8_t i = 0; i < MAX_DEVICES; i++) {
+        Device* d = &app->devices[i];
+        if(!d->used) continue;
+        uint32_t age = now - d->last_seen;
+        if(d->visible && age > furi_ms_to_ticks(EXPIRE_MS)) {
+            d->visible = false;
+            changed = true;
+        }
+        if(!d->visible && !d->favorite && i != app->detail_id &&
+           age > furi_ms_to_ticks(FORGET_MS)) {
+            memset(d, 0, sizeof(Device));
+            changed = true;
+        }
+    }
+    return changed;
 }
 
 static void devices_end_round(FlipperNinaApp* app, bool is_wifi) {
@@ -459,37 +487,78 @@ static size_t split_fields(char* line, char** fields, size_t max) {
     return n;
 }
 
+static bool is_hex_digit(char c) {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+}
+
+static uint8_t hex_value(char c) {
+    if(c <= '9') return c - '0';
+    return (c | 0x20) - 'a' + 10;
+}
+
+static bool is_mac_address(const char* s) {
+    if(strlen(s) != 17) return false;
+    for(size_t i = 0; i < 17; i++) {
+        if(i % 3 == 2 ? s[i] != ':' : !is_hex_digit(s[i])) return false;
+    }
+    return true;
+}
+
+static bool parse_rssi(const char* s, int8_t* rssi) {
+    int value = atoi(s);
+    if(s[0] != '-' || value < -127 || value > 0) return false;
+    *rssi = value;
+    return true;
+}
+
+// Checks and strips the trailing *XX checksum (XOR of all preceding bytes).
+static bool line_verify(char* line) {
+    char* star = strrchr(line, '*');
+    if(!star || strlen(star) != 3 || !is_hex_digit(star[1]) || !is_hex_digit(star[2])) {
+        return false;
+    }
+    uint8_t sum = 0;
+    for(const char* p = line; p < star; p++) sum ^= (uint8_t)*p;
+    if(sum != (hex_value(star[1]) << 4 | hex_value(star[2]))) return false;
+    *star = '\0';
+    return true;
+}
+
 static void handle_line(FlipperNinaApp* app, char* line) {
-    char* f[8];
+    if(!line_verify(line)) return;
+
+    // One spare slot so lines with too many fields are rejected
+    char* f[9];
     size_t n = split_fields(line, f, COUNT_OF(f));
     bool is_record = f[0][0] != '\0' && f[0][1] == '\0';
     if(!is_record) return;
+    int8_t rssi;
 
     furi_mutex_acquire(app->mutex, FuriWaitForever);
     app->link = LinkOk;
-    if(f[0][0] == 'B' && n >= 7) {
+    if(f[0][0] == 'B' && n == 8 && is_mac_address(f[1]) && parse_rssi(f[2], &rssi)) {
         Device* d = device_find_or_add(app, false, f[1]);
         if(d) {
-            d->rssi = atoi(f[2]);
+            d->rssi = rssi;
             copy_field(d->name, sizeof(d->name), f[3]);
             copy_field(d->vendor, sizeof(d->vendor), f[4]);
             copy_field(d->make, sizeof(d->make), f[5]);
             copy_field(d->model, sizeof(d->model), f[6]);
-            if(n >= 8 && (f[7][0] == 'I' || f[7][0] == 'A')) d->os = f[7][0];
+            if(f[7][0] == 'I' || f[7][0] == 'A') d->os = f[7][0];
             device_update_display(d);
             device_mark_seen(app, d);
         }
-    } else if(f[0][0] == 'W' && n >= 6) {
+    } else if(f[0][0] == 'W' && n == 6 && is_mac_address(f[1]) && parse_rssi(f[2], &rssi)) {
         Device* d = device_find_or_add(app, true, f[1]);
         if(d) {
-            d->rssi = atoi(f[2]);
+            d->rssi = rssi;
             copy_field(d->name, sizeof(d->name), f[3]);
             copy_field(d->security, sizeof(d->security), f[4]);
             d->channel = atoi(f[5]);
             device_update_display(d);
             device_mark_seen(app, d);
         }
-    } else if(f[0][0] == 'E' && n >= 2) {
+    } else if(f[0][0] == 'E' && n == 2) {
         devices_end_round(app, f[1][0] == 'W');
     }
     app->dirty = true;
@@ -800,6 +869,7 @@ static bool custom_event_callback(void* context, uint32_t event) {
     }
     if(event == EventRefresh) {
         furi_mutex_acquire(app->mutex, FuriWaitForever);
+        if(devices_expire(app)) app->dirty = true;
         bool dirty = app->dirty;
         bool sound = app->pending_sound;
         bool vibro = app->pending_vibro;
@@ -865,7 +935,7 @@ static FlipperNinaApp* app_alloc(void) {
 
     app->mutex = furi_mutex_alloc(FuriMutexTypeNormal);
     favorites_load(app);
-    app->rx_stream = furi_stream_buffer_alloc(1024, 1);
+    app->rx_stream = furi_stream_buffer_alloc(RX_BUFFER_SIZE, 1);
     app->worker = furi_thread_alloc_ex("NinaUartWorker", 2048, uart_worker, app);
     furi_thread_start(app->worker);
 

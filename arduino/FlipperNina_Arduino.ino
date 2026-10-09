@@ -5,6 +5,7 @@
 //   B <addr> <rssi> <name> <vendor> <make> <model> <os>   BLE device, os = I (iOS), A (Android) or empty
 //   W <bssid> <rssi> <ssid> <security> <channel>          WiFi network
 //   E B | E W                                             end of a BLE / WiFi round
+// Every line ends with *XX: XOR of all preceding bytes in hex, so the Flipper can drop corrupted lines.
 
 #include <ArduinoBLE.h>
 #include <WiFiNINA.h>
@@ -69,7 +70,7 @@ Device* findOrAdd(const String& address) {
     if (d.used && d.address == address) return &d;
     if (!d.used) {
       if (!slot || slot->used) slot = &d;
-    } else if (!d.seen && (!slot || (slot->used && d.lastSeen < slot->lastSeen))) {
+    } else if (!d.seen && (!slot || (slot->used && (long)(slot->lastSeen - d.lastSeen) > 0))) {
       slot = &d;
     }
   }
@@ -136,22 +137,31 @@ String readStringChar(BLEDevice& peripheral, const char* uuid) {
   return clean(s);
 }
 
+void sendLine(const String& line) {
+  uint8_t sum = 0;
+  for (unsigned int i = 0; i < line.length(); i++) sum ^= (uint8_t)line[i];
+  char tail[5];
+  snprintf(tail, sizeof(tail), "*%02X\n", sum);
+  FLIPPER.print(line);
+  FLIPPER.print(tail);
+}
+
 void sendBle(const Device& d) {
-  FLIPPER.print("B\t");
-  FLIPPER.print(d.address);
-  FLIPPER.print('\t');
-  FLIPPER.print(d.rssi);
-  FLIPPER.print('\t');
-  FLIPPER.print(d.name);
-  FLIPPER.print('\t');
-  FLIPPER.print(d.vendor);
-  FLIPPER.print('\t');
-  FLIPPER.print(d.make);
-  FLIPPER.print('\t');
-  FLIPPER.print(d.model);
-  FLIPPER.print('\t');
-  if (d.os) FLIPPER.print(d.os);
-  FLIPPER.print('\n');
+  String line = "B\t";
+  line += d.address;
+  line += '\t';
+  line += d.rssi;
+  line += '\t';
+  line += d.name;
+  line += '\t';
+  line += d.vendor;
+  line += '\t';
+  line += d.make;
+  line += '\t';
+  line += d.model;
+  line += '\t';
+  if (d.os) line += d.os;
+  sendLine(line);
 }
 
 // Connects to the device and reads make/model from the Device Information Service.
@@ -237,7 +247,7 @@ void bleRound() {
     if (d.make.length() || d.model.length()) sendBle(d);
   }
 
-  FLIPPER.print("E\tB\n");
+  sendLine("E\tB");
   BLE.end();
 }
 
@@ -268,20 +278,20 @@ void wifiRound() {
     snprintf(bssid, sizeof(bssid), "%02X:%02X:%02X:%02X:%02X:%02X",
              b[5], b[4], b[3], b[2], b[1], b[0]);
 
-    FLIPPER.print("W\t");
-    FLIPPER.print(bssid);
-    FLIPPER.print('\t');
-    FLIPPER.print(WiFi.RSSI(i));
-    FLIPPER.print('\t');
-    FLIPPER.print(clean(WiFi.SSID(i)));
-    FLIPPER.print('\t');
-    FLIPPER.print(securityName(WiFi.encryptionType(i)));
-    FLIPPER.print('\t');
-    FLIPPER.print(WiFi.channel(i));
-    FLIPPER.print('\n');
+    String line = "W\t";
+    line += bssid;
+    line += '\t';
+    line += WiFi.RSSI(i);
+    line += '\t';
+    line += clean(WiFi.SSID(i));
+    line += '\t';
+    line += securityName(WiFi.encryptionType(i));
+    line += '\t';
+    line += WiFi.channel(i);
+    sendLine(line);
   }
 
-  FLIPPER.print("E\tW\n");
+  sendLine("E\tW");
   WiFi.end();
 }
 
