@@ -5,9 +5,12 @@
 #include <gui/modules/submenu.h>
 #include <gui/modules/widget.h>
 #include <gui/modules/variable_item_list.h>
+#include <gui/modules/text_input.h>
 #include <gui/elements.h>
 #include <notification/notification_messages.h>
 #include <expansion/expansion.h>
+#include <storage/storage.h>
+#include <toolbox/stream/file_stream.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -15,6 +18,8 @@ typedef enum {
     ViewMainMenu,
     ViewDeviceList,
     ViewDetail,
+    ViewNameInput,
+    ViewAlerts,
     ViewSettings,
     ViewAbout,
 } AppView;
@@ -33,6 +38,7 @@ typedef enum {
 
 typedef enum {
     EventToggleFavorite,
+    EventOpenAlerts,
     EventRefresh,
 } AppEvent;
 
@@ -56,6 +62,8 @@ typedef enum {
 #define LIST_ROWS       4
 #define LIST_TOP        13
 #define LIST_ROW_HEIGHT 12
+#define ALIAS_LEN       33
+#define FAVORITES_PATH  APP_DATA_PATH("favorites.txt")
 
 // XBM, LSB = leftmost pixel
 static const uint8_t icon_ble_5x9[] = {0x04, 0x0C, 0x15, 0x0E, 0x04, 0x0E, 0x15, 0x0C, 0x04};
@@ -63,10 +71,39 @@ static const uint8_t icon_wifi_7x7[] = {0x3E, 0x41, 0x00, 0x1C, 0x22, 0x00, 0x08
 
 static const char* const on_off_text[] = {"Off", "On"};
 
+static const NotificationSequence sequence_alert_sound = {
+    &message_note_c7,
+    &message_delay_100,
+    &message_note_e7,
+    &message_delay_100,
+    &message_sound_off,
+    NULL,
+};
+
+static const NotificationSequence sequence_alert_vibro = {
+    &message_vibro_on,
+    &message_delay_250,
+    &message_vibro_off,
+    NULL,
+};
+
+static const NotificationSequence sequence_alert_both = {
+    &message_vibro_on,
+    &message_note_c7,
+    &message_delay_100,
+    &message_note_e7,
+    &message_delay_100,
+    &message_sound_off,
+    &message_vibro_off,
+    NULL,
+};
+
 typedef struct {
     bool used;
     bool is_wifi;
     bool favorite;
+    bool alert_sound;
+    bool alert_vibro;
     bool visible;
     bool seen;
     uint8_t misses;
@@ -79,6 +116,8 @@ typedef struct {
     char make[33];
     char model[33];
     char security[8];
+    // User-given name of a favorite; overrides everything else
+    char alias[ALIAS_LEN];
     char display[104];
 } Device;
 
@@ -109,10 +148,15 @@ typedef struct {
     Submenu* main_menu;
     View* device_list;
     Widget* detail;
+    TextInput* name_input;
+    char name_buffer[ALIAS_LEN];
+    VariableItemList* alerts;
     VariableItemList* settings;
     Widget* about;
     ListMode list_mode;
     uint32_t selected;
+    // Device shown in the detail, name and alerts screens
+    uint32_t detail_id;
     uint8_t beep_enabled;
     // Only turn 5V off on exit if this app turned it on
     bool otg_enabled_by_app;
@@ -125,7 +169,8 @@ typedef struct {
     Device devices[MAX_DEVICES];
     LinkStatus link;
     bool dirty;
-    bool favorite_appeared;
+    bool pending_sound;
+    bool pending_vibro;
 } FlipperNinaApp;
 
 static int entry_rank(const ListEntry* e) {
@@ -271,6 +316,7 @@ static bool device_list_input(InputEvent* event, void* context) {
     view_commit_model(app->device_list, true);
 
     if(open) {
+        app->detail_id = app->selected;
         detail_rebuild(app);
         view_dispatcher_switch_to_view(app->view_dispatcher, ViewDetail);
     }
@@ -287,7 +333,9 @@ static void device_update_display(Device* d) {
     size_t size = sizeof(d->display);
     const char* short_addr = strlen(d->address) >= 17 ? d->address + 9 : d->address;
 
-    if(d->is_wifi) {
+    if(d->alias[0]) {
+        copy_field(out, size, d->alias);
+    } else if(d->is_wifi) {
         if(d->name[0]) {
             copy_field(out, size, d->name);
         } else {
@@ -334,7 +382,10 @@ static Device* device_find_or_add(FlipperNinaApp* app, bool is_wifi, const char*
 }
 
 static void device_mark_seen(FlipperNinaApp* app, Device* d) {
-    if(!d->visible && d->favorite) app->favorite_appeared = true;
+    if(!d->visible && d->favorite) {
+        if(d->alert_sound) app->pending_sound = true;
+        if(d->alert_vibro) app->pending_vibro = true;
+    }
     d->visible = true;
     d->seen = true;
     d->misses = 0;
@@ -453,19 +504,75 @@ static void refresh_timer_callback(void* context) {
     view_dispatcher_send_custom_event(app->view_dispatcher, EventRefresh);
 }
 
+// One line per favorite: <B|W> <address> <alias> <sound 0|1> <vibrate 0|1>, tab-separated.
+static void favorites_save(FlipperNinaApp* app) {
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    Stream* stream = file_stream_alloc(storage);
+    if(file_stream_open(stream, FAVORITES_PATH, FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
+        furi_mutex_acquire(app->mutex, FuriWaitForever);
+        for(uint8_t i = 0; i < MAX_DEVICES; i++) {
+            const Device* d = &app->devices[i];
+            if(!d->used || !d->favorite) continue;
+            stream_write_format(
+                stream,
+                "%c\t%s\t%s\t%u\t%u\n",
+                d->is_wifi ? 'W' : 'B',
+                d->address,
+                d->alias,
+                d->alert_sound,
+                d->alert_vibro);
+        }
+        furi_mutex_release(app->mutex);
+    }
+    file_stream_close(stream);
+    stream_free(stream);
+    furi_record_close(RECORD_STORAGE);
+}
+
+static void favorites_load(FlipperNinaApp* app) {
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    Stream* stream = file_stream_alloc(storage);
+    FuriString* line = furi_string_alloc();
+    char buf[LINE_MAX_LEN];
+    char* f[5];
+
+    if(file_stream_open(stream, FAVORITES_PATH, FSAM_READ, FSOM_OPEN_EXISTING)) {
+        while(stream_read_line(stream, line)) {
+            furi_string_trim(line);
+            copy_field(buf, sizeof(buf), furi_string_get_cstr(line));
+            size_t n = split_fields(buf, f, COUNT_OF(f));
+            if(n < 2 || f[0][1] != '\0' || (f[0][0] != 'B' && f[0][0] != 'W')) continue;
+
+            Device* d = device_find_or_add(app, f[0][0] == 'W', f[1]);
+            if(!d) break;
+            d->favorite = true;
+            if(n >= 3) copy_field(d->alias, sizeof(d->alias), f[2]);
+            d->alert_sound = n < 4 || f[3][0] != '0';
+            d->alert_vibro = n < 5 || f[4][0] != '0';
+            device_update_display(d);
+        }
+    }
+    file_stream_close(stream);
+    stream_free(stream);
+    furi_string_free(line);
+    furi_record_close(RECORD_STORAGE);
+}
+
 static void detail_button_callback(GuiButtonType result, InputType type, void* context) {
     FlipperNinaApp* app = context;
     if(type == InputTypeShort && result == GuiButtonTypeCenter) {
         view_dispatcher_send_custom_event(app->view_dispatcher, EventToggleFavorite);
+    } else if(type == InputTypeShort && result == GuiButtonTypeRight) {
+        view_dispatcher_send_custom_event(app->view_dispatcher, EventOpenAlerts);
     }
 }
 
 static void detail_rebuild(FlipperNinaApp* app) {
-    if(app->selected >= MAX_DEVICES) return;
+    if(app->detail_id >= MAX_DEVICES) return;
     char line[72];
 
     furi_mutex_acquire(app->mutex, FuriWaitForever);
-    const Device* dev = &app->devices[app->selected];
+    const Device* dev = &app->devices[app->detail_id];
     if(!dev->used) {
         furi_mutex_release(app->mutex);
         return;
@@ -511,6 +618,10 @@ static void detail_rebuild(FlipperNinaApp* app) {
         dev->favorite ? "Unfav" : "Fav",
         detail_button_callback,
         app);
+    if(dev->favorite) {
+        widget_add_button_element(
+            app->detail, GuiButtonTypeRight, "Alerts", detail_button_callback, app);
+    }
     furi_mutex_release(app->mutex);
 }
 
@@ -535,28 +646,126 @@ static void main_menu_callback(void* context, uint32_t index) {
     }
 }
 
+static void name_input_done(void* context) {
+    FlipperNinaApp* app = context;
+    furi_mutex_acquire(app->mutex, FuriWaitForever);
+    if(app->detail_id < MAX_DEVICES) {
+        Device* d = &app->devices[app->detail_id];
+        if(!d->favorite) {
+            d->alert_sound = true;
+            d->alert_vibro = true;
+        }
+        d->favorite = true;
+        copy_field(d->alias, sizeof(d->alias), app->name_buffer);
+        device_update_display(d);
+    }
+    furi_mutex_release(app->mutex);
+
+    favorites_save(app);
+    detail_rebuild(app);
+    device_list_refresh(app);
+    view_dispatcher_switch_to_view(app->view_dispatcher, ViewDetail);
+}
+
+static void alert_changed(VariableItem* item, bool is_sound) {
+    FlipperNinaApp* app = variable_item_get_context(item);
+    uint8_t on = variable_item_get_current_value_index(item);
+    variable_item_set_current_value_text(item, on_off_text[on]);
+
+    furi_mutex_acquire(app->mutex, FuriWaitForever);
+    if(app->detail_id < MAX_DEVICES) {
+        Device* d = &app->devices[app->detail_id];
+        if(is_sound) {
+            d->alert_sound = on;
+        } else {
+            d->alert_vibro = on;
+        }
+    }
+    furi_mutex_release(app->mutex);
+    favorites_save(app);
+}
+
+static void alert_sound_changed(VariableItem* item) {
+    alert_changed(item, true);
+}
+
+static void alert_vibro_changed(VariableItem* item) {
+    alert_changed(item, false);
+}
+
+static void alerts_open(FlipperNinaApp* app) {
+    if(app->detail_id >= MAX_DEVICES) return;
+    furi_mutex_acquire(app->mutex, FuriWaitForever);
+    uint8_t sound = app->devices[app->detail_id].alert_sound;
+    uint8_t vibro = app->devices[app->detail_id].alert_vibro;
+    furi_mutex_release(app->mutex);
+
+    variable_item_list_reset(app->alerts);
+    VariableItem* item = variable_item_list_add(app->alerts, "Sound", 2, alert_sound_changed, app);
+    variable_item_set_current_value_index(item, sound);
+    variable_item_set_current_value_text(item, on_off_text[sound]);
+    item = variable_item_list_add(app->alerts, "Vibrate", 2, alert_vibro_changed, app);
+    variable_item_set_current_value_index(item, vibro);
+    variable_item_set_current_value_text(item, on_off_text[vibro]);
+    view_dispatcher_switch_to_view(app->view_dispatcher, ViewAlerts);
+}
+
 static bool custom_event_callback(void* context, uint32_t event) {
     FlipperNinaApp* app = context;
+    if(event == EventOpenAlerts) {
+        alerts_open(app);
+        return true;
+    }
     if(event == EventToggleFavorite) {
+        if(app->detail_id >= MAX_DEVICES) return true;
+
         furi_mutex_acquire(app->mutex, FuriWaitForever);
-        if(app->selected < MAX_DEVICES) {
-            app->devices[app->selected].favorite = !app->devices[app->selected].favorite;
+        Device* d = &app->devices[app->detail_id];
+        bool unfav = d->favorite;
+        if(unfav) {
+            d->favorite = false;
+            d->alias[0] = '\0';
+            device_update_display(d);
+        } else {
+            copy_field(app->name_buffer, sizeof(app->name_buffer), d->display);
         }
         furi_mutex_release(app->mutex);
-        detail_rebuild(app);
-        device_list_refresh(app);
+
+        if(unfav) {
+            favorites_save(app);
+            detail_rebuild(app);
+            device_list_refresh(app);
+        } else {
+            // Re-set after prefilling so the cursor lands at the end of the text
+            text_input_set_result_callback(
+                app->name_input,
+                name_input_done,
+                app,
+                app->name_buffer,
+                sizeof(app->name_buffer),
+                false);
+            view_dispatcher_switch_to_view(app->view_dispatcher, ViewNameInput);
+        }
         return true;
     }
     if(event == EventRefresh) {
         furi_mutex_acquire(app->mutex, FuriWaitForever);
         bool dirty = app->dirty;
-        bool beep = app->favorite_appeared;
+        bool sound = app->pending_sound;
+        bool vibro = app->pending_vibro;
         app->dirty = false;
-        app->favorite_appeared = false;
+        app->pending_sound = false;
+        app->pending_vibro = false;
         furi_mutex_release(app->mutex);
 
-        if(beep && app->beep_enabled) {
-            notification_message(app->notifications, &sequence_success);
+        if(app->beep_enabled) {
+            if(sound && vibro) {
+                notification_message(app->notifications, &sequence_alert_both);
+            } else if(sound) {
+                notification_message(app->notifications, &sequence_alert_sound);
+            } else if(vibro) {
+                notification_message(app->notifications, &sequence_alert_vibro);
+            }
         }
         if(dirty) {
             device_list_refresh(app);
@@ -588,17 +797,24 @@ static uint32_t nav_device_list(void* context) {
     return ViewDeviceList;
 }
 
+static uint32_t nav_detail(void* context) {
+    UNUSED(context);
+    return ViewDetail;
+}
+
 static FlipperNinaApp* app_alloc(void) {
     FlipperNinaApp* app = malloc(sizeof(FlipperNinaApp));
     memset(app, 0, sizeof(FlipperNinaApp));
     app->list_mode = ListNearby;
     app->selected = UINT32_MAX;
+    app->detail_id = UINT32_MAX;
     app->beep_enabled = 1;
 
     app->otg_enabled_by_app = !furi_hal_power_is_otg_enabled();
     if(app->otg_enabled_by_app) furi_hal_power_enable_otg();
 
     app->mutex = furi_mutex_alloc(FuriMutexTypeNormal);
+    favorites_load(app);
     app->rx_stream = furi_stream_buffer_alloc(1024, 1);
     app->worker = furi_thread_alloc_ex("NinaUartWorker", 2048, uart_worker, app);
     furi_thread_start(app->worker);
@@ -644,9 +860,20 @@ static FlipperNinaApp* app_alloc(void) {
     view_set_previous_callback(widget_get_view(app->detail), nav_device_list);
     view_dispatcher_add_view(app->view_dispatcher, ViewDetail, widget_get_view(app->detail));
 
+    app->name_input = text_input_alloc();
+    text_input_set_header_text(app->name_input, "Name this favorite");
+    view_set_previous_callback(text_input_get_view(app->name_input), nav_detail);
+    view_dispatcher_add_view(
+        app->view_dispatcher, ViewNameInput, text_input_get_view(app->name_input));
+
+    app->alerts = variable_item_list_alloc();
+    view_set_previous_callback(variable_item_list_get_view(app->alerts), nav_detail);
+    view_dispatcher_add_view(
+        app->view_dispatcher, ViewAlerts, variable_item_list_get_view(app->alerts));
+
     app->settings = variable_item_list_alloc();
     VariableItem* item =
-        variable_item_list_add(app->settings, "Beep on favorite", 2, beep_changed, app);
+        variable_item_list_add(app->settings, "Favorite alerts", 2, beep_changed, app);
     variable_item_set_current_value_index(item, app->beep_enabled);
     variable_item_set_current_value_text(item, on_off_text[app->beep_enabled]);
     view_set_previous_callback(variable_item_list_get_view(app->settings), nav_main_menu);
@@ -697,12 +924,16 @@ static void app_free(FlipperNinaApp* app) {
     view_dispatcher_remove_view(app->view_dispatcher, ViewMainMenu);
     view_dispatcher_remove_view(app->view_dispatcher, ViewDeviceList);
     view_dispatcher_remove_view(app->view_dispatcher, ViewDetail);
+    view_dispatcher_remove_view(app->view_dispatcher, ViewNameInput);
+    view_dispatcher_remove_view(app->view_dispatcher, ViewAlerts);
     view_dispatcher_remove_view(app->view_dispatcher, ViewSettings);
     view_dispatcher_remove_view(app->view_dispatcher, ViewAbout);
 
     submenu_free(app->main_menu);
     view_free(app->device_list);
     widget_free(app->detail);
+    text_input_free(app->name_input);
+    variable_item_list_free(app->alerts);
     variable_item_list_free(app->settings);
     widget_free(app->about);
     view_dispatcher_free(app->view_dispatcher);
