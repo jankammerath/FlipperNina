@@ -38,6 +38,6 @@ Notes:
 
 - TX and RX are crossed: Flipper TX goes to Nano RX and vice versa.
 - Use the Nano's **VIN** pin, not the `+5V` pin. On the Nano RP2040 Connect the `+5V` pin is not connected to the power input unless its solder jumper is closed.
-- The 5V output on pin 1 is off by default. Turn it on under **GPIO → 5V on GPIO → ON** on the Flipper.
+- The app turns on the 5V output on pin 1 when it starts and turns it off when it exits.
 - The Arduino sketch must use `Serial1` (pins D0/D1) to talk to the Flipper. `Serial` is the USB port.
 

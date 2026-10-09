@@ -1,4 +1,5 @@
 #include <furi.h>
+#include <furi_hal.h>
 #include <gui/gui.h>
 #include <gui/view_dispatcher.h>
 #include <gui/modules/submenu.h>
@@ -100,6 +101,8 @@ typedef struct {
     uint32_t selected;
     uint8_t beep_enabled;
     uint8_t interval_index;
+    // Only turn 5V off on exit if this app turned it on
+    bool otg_enabled_by_app;
 } FlipperNinaApp;
 
 static int entry_rank(const ListEntry* e) {
@@ -377,6 +380,9 @@ static FlipperNinaApp* app_alloc(void) {
     app->beep_enabled = 1;
     app->interval_index = 1;
 
+    app->otg_enabled_by_app = !furi_hal_power_is_otg_enabled();
+    if(app->otg_enabled_by_app) furi_hal_power_enable_otg();
+
     app->gui = furi_record_open(RECORD_GUI);
     app->notifications = furi_record_open(RECORD_NOTIFICATION);
 
@@ -444,6 +450,7 @@ static FlipperNinaApp* app_alloc(void) {
 
 static void app_free(FlipperNinaApp* app) {
     furi_timer_stop(app->refresh_timer);
+    if(app->otg_enabled_by_app) furi_hal_power_disable_otg();
     furi_timer_free(app->refresh_timer);
 
     view_dispatcher_remove_view(app->view_dispatcher, ViewMainMenu);
