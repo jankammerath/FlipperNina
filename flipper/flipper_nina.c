@@ -7,7 +7,9 @@
 #include <gui/modules/variable_item_list.h>
 #include <gui/elements.h>
 #include <notification/notification_messages.h>
+#include <expansion/expansion.h>
 #include <stdlib.h>
+#include <string.h>
 
 typedef enum {
     ViewMainMenu,
@@ -34,41 +36,51 @@ typedef enum {
     EventRefresh,
 } AppEvent;
 
-typedef struct {
-    bool is_wifi;
-    const char* name;
-    const char* address;
-    int8_t rssi;
-    // Vendor for BLE, security/channel for WiFi
-    const char* info;
-    bool favorite;
-    bool visible;
-} MockDevice;
+typedef enum {
+    WorkerEvtStop = (1 << 0),
+    WorkerEvtRx = (1 << 1),
+} WorkerEvt;
 
-static MockDevice mock_devices[] = {
-    {false, "iPhone", "4C:12:9A:33:F0:01", -48, "Apple", true, true},
-    {false, "Galaxy Buds2", "D8:3A:11:B2:7C:44", -61, "Samsung", false, true},
-    {false, "(no name)", "6E:01:5F:A9:22:9B", -77, "Microsoft", false, true},
-    {false, "fenix 7", "C4:7F:20:0E:51:D3", -70, "Garmin", false, false},
-    {false, "Echo Dot", "F0:81:73:4A:CC:10", -83, "Amazon", false, true},
-    {true, "HomeNet", "A0:63:91:5E:02:7A", -42, "WPA2  ch 6", true, true},
-    {true, "FRITZ!Box 7590", "3C:A6:2F:19:88:E1", -58, "WPA2  ch 11", false, true},
-    {true, "Guest", "3E:A6:2F:19:88:E2", -66, "Open  ch 1", false, false},
-    {true, "DIRECT-HP-Printer", "FA:DA:0C:73:B4:05", -80, "WPA2  ch 6", false, true},
-};
+typedef enum {
+    LinkWaiting,
+    LinkOk,
+    LinkNoUart,
+} LinkStatus;
 
-#define MOCK_DEVICE_COUNT COUNT_OF(mock_devices)
-#define LIST_ROWS         4
-#define LIST_TOP          13
-#define LIST_ROW_HEIGHT   12
+#define MAX_DEVICES 48
+// A device counts as out of range after missing this many scan rounds
+#define MISSED_ROUNDS   2
+#define UART_BAUD       115200
+#define LINE_MAX_LEN    192
+#define REFRESH_MS      500
+#define LIST_ROWS       4
+#define LIST_TOP        13
+#define LIST_ROW_HEIGHT 12
 
 // XBM, LSB = leftmost pixel
 static const uint8_t icon_ble_5x9[] = {0x04, 0x0C, 0x15, 0x0E, 0x04, 0x0E, 0x15, 0x0C, 0x04};
 static const uint8_t icon_wifi_7x7[] = {0x3E, 0x41, 0x00, 0x1C, 0x22, 0x00, 0x08};
 
 static const char* const on_off_text[] = {"Off", "On"};
-static const char* const interval_text[] = {"2s", "4s", "8s"};
-static const uint32_t interval_ms[] = {2000, 4000, 8000};
+
+typedef struct {
+    bool used;
+    bool is_wifi;
+    bool favorite;
+    bool visible;
+    bool seen;
+    uint8_t misses;
+    int8_t rssi;
+    uint8_t channel;
+    char address[18];
+    // Advertised name for BLE, SSID for WiFi
+    char name[33];
+    char vendor[20];
+    char make[33];
+    char model[33];
+    char security[8];
+    char display[104];
+} Device;
 
 typedef struct {
     uint8_t id;
@@ -76,20 +88,22 @@ typedef struct {
     bool favorite;
     bool visible;
     int8_t rssi;
-    const char* name;
+    char name[40];
 } ListEntry;
 
 typedef struct {
     ListMode mode;
+    LinkStatus link;
     uint8_t count;
     uint8_t cursor;
     uint8_t offset;
-    ListEntry entries[MOCK_DEVICE_COUNT];
+    ListEntry entries[MAX_DEVICES];
 } DeviceListModel;
 
 typedef struct {
     Gui* gui;
     NotificationApp* notifications;
+    Expansion* expansion;
     ViewDispatcher* view_dispatcher;
     FuriTimer* refresh_timer;
     Submenu* main_menu;
@@ -100,9 +114,18 @@ typedef struct {
     ListMode list_mode;
     uint32_t selected;
     uint8_t beep_enabled;
-    uint8_t interval_index;
     // Only turn 5V off on exit if this app turned it on
     bool otg_enabled_by_app;
+
+    FuriHalSerialHandle* serial;
+    FuriStreamBuffer* rx_stream;
+    FuriThread* worker;
+    // Guards everything below; shared with the UART worker thread
+    FuriMutex* mutex;
+    Device devices[MAX_DEVICES];
+    LinkStatus link;
+    bool dirty;
+    bool favorite_appeared;
 } FlipperNinaApp;
 
 static int entry_rank(const ListEntry* e) {
@@ -119,8 +142,11 @@ static void device_list_refresh(FlipperNinaApp* app) {
     DeviceListModel* model = view_get_model(app->device_list);
     model->mode = app->list_mode;
     model->count = 0;
-    for(uint8_t i = 0; i < MOCK_DEVICE_COUNT; i++) {
-        const MockDevice* dev = &mock_devices[i];
+    furi_mutex_acquire(app->mutex, FuriWaitForever);
+    model->link = app->link;
+    for(uint8_t i = 0; i < MAX_DEVICES; i++) {
+        const Device* dev = &app->devices[i];
+        if(!dev->used) continue;
         if(app->list_mode == ListFavorites ? !dev->favorite : !dev->visible) continue;
 
         ListEntry e;
@@ -129,7 +155,7 @@ static void device_list_refresh(FlipperNinaApp* app) {
         e.favorite = dev->favorite;
         e.visible = dev->visible;
         e.rssi = dev->rssi;
-        e.name = dev->name;
+        snprintf(e.name, sizeof(e.name), "%s", dev->display);
 
         uint8_t pos = model->count;
         while(pos > 0 && entry_rank(&model->entries[pos - 1]) < entry_rank(&e)) {
@@ -139,6 +165,7 @@ static void device_list_refresh(FlipperNinaApp* app) {
         model->entries[pos] = e;
         model->count++;
     }
+    furi_mutex_release(app->mutex);
 
     bool found = false;
     for(uint8_t i = 0; i < model->count; i++) {
@@ -179,7 +206,10 @@ static void device_list_draw(Canvas* canvas, void* _model) {
 
     canvas_set_font(canvas, FontSecondary);
     if(model->count == 0) {
-        canvas_draw_str_aligned(canvas, 64, 38, AlignCenter, AlignCenter, "No devices");
+        const char* text = "No devices";
+        if(model->link == LinkWaiting) text = "Waiting for Nina...";
+        if(model->link == LinkNoUart) text = "UART busy";
+        canvas_draw_str_aligned(canvas, 64, 38, AlignCenter, AlignCenter, text);
         return;
     }
 
@@ -201,8 +231,10 @@ static void device_list_draw(Canvas* canvas, void* _model) {
             canvas_draw_xbm(canvas, 3, top + 2, 5, 9, icon_ble_5x9);
         }
 
-        snprintf(buf, sizeof(buf), "%s%.16s", e->favorite ? "*" : "", e->name);
-        canvas_draw_str(canvas, 12, top + 10, buf);
+        FuriString* label = furi_string_alloc_printf("%s%s", e->favorite ? "*" : "", e->name);
+        elements_string_fit_width(canvas, label, 88);
+        canvas_draw_str(canvas, 12, top + 10, furi_string_get_cstr(label));
+        furi_string_free(label);
 
         if(e->visible) {
             snprintf(buf, sizeof(buf), "%d", e->rssi);
@@ -245,23 +277,175 @@ static bool device_list_input(InputEvent* event, void* context) {
     return true;
 }
 
-// Simulates a scan round; returns true if a favorite came into range.
-static bool mock_scan_step(void) {
-    bool favorite_appeared = false;
-    for(uint8_t i = 0; i < MOCK_DEVICE_COUNT; i++) {
-        MockDevice* dev = &mock_devices[i];
-        if(rand() % 10 == 0) {
-            dev->visible = !dev->visible;
-            if(dev->visible) {
-                dev->rssi = -90 + rand() % 10;
-                if(dev->favorite) favorite_appeared = true;
-            }
-        } else if(dev->visible) {
-            int rssi = dev->rssi + rand() % 7 - 3;
-            dev->rssi = CLAMP(rssi, -35, -95);
+static void copy_field(char* dst, size_t size, const char* src) {
+    snprintf(dst, size, "%s", src);
+}
+
+// Picks the most readable name from what the Nina reported.
+static void device_update_display(Device* d) {
+    char* out = d->display;
+    size_t size = sizeof(d->display);
+    const char* short_addr = strlen(d->address) >= 17 ? d->address + 9 : d->address;
+
+    if(d->is_wifi) {
+        if(d->name[0]) {
+            copy_field(out, size, d->name);
+        } else {
+            snprintf(out, size, "Hidden %s", short_addr);
+        }
+    } else if(d->name[0] && d->make[0] && d->model[0]) {
+        snprintf(out, size, "%s - %s %s", d->name, d->make, d->model);
+    } else if(d->name[0]) {
+        copy_field(out, size, d->name);
+    } else if(d->make[0] && d->model[0]) {
+        snprintf(out, size, "%s %s", d->make, d->model);
+    } else if(d->model[0]) {
+        copy_field(out, size, d->model);
+    } else if(d->make[0]) {
+        snprintf(out, size, "%s %s", d->make, short_addr);
+    } else if(d->vendor[0]) {
+        snprintf(out, size, "%s %s", d->vendor, short_addr);
+    } else {
+        copy_field(out, size, d->address);
+    }
+}
+
+// Reuses the stalest out-of-range, non-favorite slot when the table is full.
+static Device* device_find_or_add(FlipperNinaApp* app, bool is_wifi, const char* address) {
+    Device* free_slot = NULL;
+    Device* stale = NULL;
+    for(uint8_t i = 0; i < MAX_DEVICES; i++) {
+        Device* d = &app->devices[i];
+        if(!d->used) {
+            if(!free_slot) free_slot = d;
+            continue;
+        }
+        if(d->is_wifi == is_wifi && strcmp(d->address, address) == 0) return d;
+        if(!d->visible && !d->favorite && (!stale || d->misses > stale->misses)) stale = d;
+    }
+
+    Device* d = free_slot ? free_slot : stale;
+    if(!d) return NULL;
+    memset(d, 0, sizeof(Device));
+    d->used = true;
+    d->is_wifi = is_wifi;
+    copy_field(d->address, sizeof(d->address), address);
+    return d;
+}
+
+static void device_mark_seen(FlipperNinaApp* app, Device* d) {
+    if(!d->visible && d->favorite) app->favorite_appeared = true;
+    d->visible = true;
+    d->seen = true;
+    d->misses = 0;
+}
+
+static void devices_end_round(FlipperNinaApp* app, bool is_wifi) {
+    for(uint8_t i = 0; i < MAX_DEVICES; i++) {
+        Device* d = &app->devices[i];
+        if(!d->used || d->is_wifi != is_wifi) continue;
+        if(d->seen) {
+            d->seen = false;
+        } else {
+            if(d->misses < UINT8_MAX) d->misses++;
+            if(d->misses >= MISSED_ROUNDS) d->visible = false;
         }
     }
-    return favorite_appeared;
+}
+
+// Splits in place on tabs, keeping empty fields.
+static size_t split_fields(char* line, char** fields, size_t max) {
+    size_t n = 0;
+    fields[n++] = line;
+    for(char* p = line; *p && n < max; p++) {
+        if(*p == '\t') {
+            *p = '\0';
+            fields[n++] = p + 1;
+        }
+    }
+    return n;
+}
+
+static void handle_line(FlipperNinaApp* app, char* line) {
+    char* f[8];
+    size_t n = split_fields(line, f, COUNT_OF(f));
+    bool is_record = f[0][0] != '\0' && f[0][1] == '\0';
+    if(!is_record) return;
+
+    furi_mutex_acquire(app->mutex, FuriWaitForever);
+    app->link = LinkOk;
+    if(f[0][0] == 'B' && n >= 7) {
+        Device* d = device_find_or_add(app, false, f[1]);
+        if(d) {
+            d->rssi = atoi(f[2]);
+            copy_field(d->name, sizeof(d->name), f[3]);
+            copy_field(d->vendor, sizeof(d->vendor), f[4]);
+            copy_field(d->make, sizeof(d->make), f[5]);
+            copy_field(d->model, sizeof(d->model), f[6]);
+            device_update_display(d);
+            device_mark_seen(app, d);
+        }
+    } else if(f[0][0] == 'W' && n >= 6) {
+        Device* d = device_find_or_add(app, true, f[1]);
+        if(d) {
+            d->rssi = atoi(f[2]);
+            copy_field(d->name, sizeof(d->name), f[3]);
+            copy_field(d->security, sizeof(d->security), f[4]);
+            d->channel = atoi(f[5]);
+            device_update_display(d);
+            device_mark_seen(app, d);
+        }
+    } else if(f[0][0] == 'E' && n >= 2) {
+        devices_end_round(app, f[1][0] == 'W');
+    }
+    app->dirty = true;
+    furi_mutex_release(app->mutex);
+}
+
+static void serial_rx_callback(FuriHalSerialHandle* handle, FuriHalSerialRxEvent event, void* context) {
+    FlipperNinaApp* app = context;
+    if(event == FuriHalSerialRxEventData) {
+        uint8_t data = furi_hal_serial_async_rx(handle);
+        furi_stream_buffer_send(app->rx_stream, &data, 1, 0);
+        furi_thread_flags_set(furi_thread_get_id(app->worker), WorkerEvtRx);
+    }
+}
+
+static int32_t uart_worker(void* context) {
+    FlipperNinaApp* app = context;
+    char line[LINE_MAX_LEN];
+    size_t len = 0;
+    bool overflow = false;
+    uint8_t buf[64];
+
+    while(true) {
+        uint32_t events =
+            furi_thread_flags_wait(WorkerEvtStop | WorkerEvtRx, FuriFlagWaitAny, FuriWaitForever);
+        furi_check((events & FuriFlagError) == 0);
+        if(events & WorkerEvtStop) break;
+
+        size_t n;
+        while((n = furi_stream_buffer_receive(app->rx_stream, buf, sizeof(buf), 0)) > 0) {
+            for(size_t i = 0; i < n; i++) {
+                char c = buf[i];
+                if(c == '\n') {
+                    if(!overflow && len > 0) {
+                        line[len] = '\0';
+                        handle_line(app, line);
+                    }
+                    len = 0;
+                    overflow = false;
+                } else if(c == '\r') {
+                    continue;
+                } else if(len < LINE_MAX_LEN - 1) {
+                    line[len++] = c;
+                } else {
+                    overflow = true;
+                }
+            }
+        }
+    }
+    return 0;
 }
 
 static void refresh_timer_callback(void* context) {
@@ -277,25 +461,49 @@ static void detail_button_callback(GuiButtonType result, InputType type, void* c
 }
 
 static void detail_rebuild(FlipperNinaApp* app) {
-    if(app->selected >= MOCK_DEVICE_COUNT) return;
-    const MockDevice* dev = &mock_devices[app->selected];
-    char line[48];
+    if(app->selected >= MAX_DEVICES) return;
+    char line[72];
+
+    furi_mutex_acquire(app->mutex, FuriWaitForever);
+    const Device* dev = &app->devices[app->selected];
+    if(!dev->used) {
+        furi_mutex_release(app->mutex);
+        return;
+    }
 
     widget_reset(app->detail);
-    widget_add_string_element(app->detail, 0, 0, AlignLeft, AlignTop, FontPrimary, dev->name);
+    widget_add_string_element(app->detail, 0, 0, AlignLeft, AlignTop, FontPrimary, dev->display);
 
     snprintf(line, sizeof(line), "%s %s", dev->is_wifi ? "BSSID:" : "MAC:", dev->address);
-    widget_add_string_element(app->detail, 0, 14, AlignLeft, AlignTop, FontSecondary, line);
+    widget_add_string_element(app->detail, 0, 13, AlignLeft, AlignTop, FontSecondary, line);
 
     if(dev->visible) {
         snprintf(line, sizeof(line), "RSSI: %d dBm", dev->rssi);
     } else {
         snprintf(line, sizeof(line), "RSSI: out of range");
     }
-    widget_add_string_element(app->detail, 0, 25, AlignLeft, AlignTop, FontSecondary, line);
+    widget_add_string_element(app->detail, 0, 23, AlignLeft, AlignTop, FontSecondary, line);
 
-    snprintf(line, sizeof(line), "%s %s", dev->is_wifi ? "Sec:" : "Vendor:", dev->info);
-    widget_add_string_element(app->detail, 0, 36, AlignLeft, AlignTop, FontSecondary, line);
+    if(dev->is_wifi) {
+        snprintf(line, sizeof(line), "Security: %s", dev->security);
+        widget_add_string_element(app->detail, 0, 33, AlignLeft, AlignTop, FontSecondary, line);
+        snprintf(line, sizeof(line), "Channel: %u", dev->channel);
+        widget_add_string_element(app->detail, 0, 43, AlignLeft, AlignTop, FontSecondary, line);
+    } else {
+        snprintf(line, sizeof(line), "Vendor: %s", dev->vendor[0] ? dev->vendor : "-");
+        widget_add_string_element(app->detail, 0, 33, AlignLeft, AlignTop, FontSecondary, line);
+        if(dev->make[0] || dev->model[0]) {
+            snprintf(
+                line,
+                sizeof(line),
+                "Model: %s%s%s",
+                dev->make,
+                dev->make[0] && dev->model[0] ? " " : "",
+                dev->model);
+            widget_add_string_element(
+                app->detail, 0, 43, AlignLeft, AlignTop, FontSecondary, line);
+        }
+    }
 
     widget_add_button_element(
         app->detail,
@@ -303,6 +511,7 @@ static void detail_rebuild(FlipperNinaApp* app) {
         dev->favorite ? "Unfav" : "Fav",
         detail_button_callback,
         app);
+    furi_mutex_release(app->mutex);
 }
 
 static void main_menu_callback(void* context, uint32_t index) {
@@ -329,17 +538,30 @@ static void main_menu_callback(void* context, uint32_t index) {
 static bool custom_event_callback(void* context, uint32_t event) {
     FlipperNinaApp* app = context;
     if(event == EventToggleFavorite) {
-        mock_devices[app->selected].favorite = !mock_devices[app->selected].favorite;
+        furi_mutex_acquire(app->mutex, FuriWaitForever);
+        if(app->selected < MAX_DEVICES) {
+            app->devices[app->selected].favorite = !app->devices[app->selected].favorite;
+        }
+        furi_mutex_release(app->mutex);
         detail_rebuild(app);
         device_list_refresh(app);
         return true;
     }
     if(event == EventRefresh) {
-        if(mock_scan_step() && app->beep_enabled) {
+        furi_mutex_acquire(app->mutex, FuriWaitForever);
+        bool dirty = app->dirty;
+        bool beep = app->favorite_appeared;
+        app->dirty = false;
+        app->favorite_appeared = false;
+        furi_mutex_release(app->mutex);
+
+        if(beep && app->beep_enabled) {
             notification_message(app->notifications, &sequence_success);
         }
-        device_list_refresh(app);
-        detail_rebuild(app);
+        if(dirty) {
+            device_list_refresh(app);
+            detail_rebuild(app);
+        }
         return true;
     }
     return false;
@@ -349,13 +571,6 @@ static void beep_changed(VariableItem* item) {
     FlipperNinaApp* app = variable_item_get_context(item);
     app->beep_enabled = variable_item_get_current_value_index(item);
     variable_item_set_current_value_text(item, on_off_text[app->beep_enabled]);
-}
-
-static void interval_changed(VariableItem* item) {
-    FlipperNinaApp* app = variable_item_get_context(item);
-    app->interval_index = variable_item_get_current_value_index(item);
-    variable_item_set_current_value_text(item, interval_text[app->interval_index]);
-    furi_timer_start(app->refresh_timer, furi_ms_to_ticks(interval_ms[app->interval_index]));
 }
 
 static uint32_t nav_exit(void* context) {
@@ -375,13 +590,30 @@ static uint32_t nav_device_list(void* context) {
 
 static FlipperNinaApp* app_alloc(void) {
     FlipperNinaApp* app = malloc(sizeof(FlipperNinaApp));
+    memset(app, 0, sizeof(FlipperNinaApp));
     app->list_mode = ListNearby;
-    app->selected = 0;
+    app->selected = UINT32_MAX;
     app->beep_enabled = 1;
-    app->interval_index = 1;
 
     app->otg_enabled_by_app = !furi_hal_power_is_otg_enabled();
     if(app->otg_enabled_by_app) furi_hal_power_enable_otg();
+
+    app->mutex = furi_mutex_alloc(FuriMutexTypeNormal);
+    app->rx_stream = furi_stream_buffer_alloc(1024, 1);
+    app->worker = furi_thread_alloc_ex("NinaUartWorker", 2048, uart_worker, app);
+    furi_thread_start(app->worker);
+
+    // The expansion module service would otherwise hold the GPIO USART
+    app->expansion = furi_record_open(RECORD_EXPANSION);
+    expansion_disable(app->expansion);
+    app->serial = furi_hal_serial_control_acquire(FuriHalSerialIdUsart);
+    if(app->serial) {
+        app->link = LinkWaiting;
+        furi_hal_serial_init(app->serial, UART_BAUD);
+        furi_hal_serial_async_rx_start(app->serial, serial_rx_callback, app, false);
+    } else {
+        app->link = LinkNoUart;
+    }
 
     app->gui = furi_record_open(RECORD_GUI);
     app->notifications = furi_record_open(RECORD_NOTIFICATION);
@@ -417,10 +649,6 @@ static FlipperNinaApp* app_alloc(void) {
         variable_item_list_add(app->settings, "Beep on favorite", 2, beep_changed, app);
     variable_item_set_current_value_index(item, app->beep_enabled);
     variable_item_set_current_value_text(item, on_off_text[app->beep_enabled]);
-    item = variable_item_list_add(
-        app->settings, "Scan interval", COUNT_OF(interval_text), interval_changed, app);
-    variable_item_set_current_value_index(item, app->interval_index);
-    variable_item_set_current_value_text(item, interval_text[app->interval_index]);
     view_set_previous_callback(variable_item_list_get_view(app->settings), nav_main_menu);
     view_dispatcher_add_view(
         app->view_dispatcher, ViewSettings, variable_item_list_get_view(app->settings));
@@ -435,14 +663,13 @@ static FlipperNinaApp* app_alloc(void) {
         "\e#FlipperNina\n"
         "WiFi and BLE companion for\n"
         "Arduino Nano RP2040 Connect.\n\n"
-        "UI mockup - data is fake.\n"
         "Connect the Nano via UART\n"
-        "(TX/RX/GND) on GPIO.");
+        "(TX/RX/GND) and 5V on GPIO.");
     view_set_previous_callback(widget_get_view(app->about), nav_main_menu);
     view_dispatcher_add_view(app->view_dispatcher, ViewAbout, widget_get_view(app->about));
 
     app->refresh_timer = furi_timer_alloc(refresh_timer_callback, FuriTimerTypePeriodic, app);
-    furi_timer_start(app->refresh_timer, furi_ms_to_ticks(interval_ms[app->interval_index]));
+    furi_timer_start(app->refresh_timer, furi_ms_to_ticks(REFRESH_MS));
 
     view_dispatcher_switch_to_view(app->view_dispatcher, ViewMainMenu);
     return app;
@@ -450,8 +677,22 @@ static FlipperNinaApp* app_alloc(void) {
 
 static void app_free(FlipperNinaApp* app) {
     furi_timer_stop(app->refresh_timer);
-    if(app->otg_enabled_by_app) furi_hal_power_disable_otg();
     furi_timer_free(app->refresh_timer);
+
+    if(app->serial) {
+        furi_hal_serial_async_rx_stop(app->serial);
+        furi_hal_serial_deinit(app->serial);
+        furi_hal_serial_control_release(app->serial);
+    }
+    expansion_enable(app->expansion);
+    furi_record_close(RECORD_EXPANSION);
+
+    furi_thread_flags_set(furi_thread_get_id(app->worker), WorkerEvtStop);
+    furi_thread_join(app->worker);
+    furi_thread_free(app->worker);
+    furi_stream_buffer_free(app->rx_stream);
+
+    if(app->otg_enabled_by_app) furi_hal_power_disable_otg();
 
     view_dispatcher_remove_view(app->view_dispatcher, ViewMainMenu);
     view_dispatcher_remove_view(app->view_dispatcher, ViewDeviceList);
@@ -465,6 +706,7 @@ static void app_free(FlipperNinaApp* app) {
     variable_item_list_free(app->settings);
     widget_free(app->about);
     view_dispatcher_free(app->view_dispatcher);
+    furi_mutex_free(app->mutex);
 
     furi_record_close(RECORD_NOTIFICATION);
     furi_record_close(RECORD_GUI);
