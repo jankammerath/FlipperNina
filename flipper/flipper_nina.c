@@ -37,6 +37,13 @@ typedef enum {
 } ListMode;
 
 typedef enum {
+    FilterAll,
+    FilterWifi,
+    FilterBle,
+    FilterCount,
+} NearbyFilter;
+
+typedef enum {
     EventToggleFavorite,
     EventOpenAlerts,
     EventRefresh,
@@ -132,6 +139,7 @@ typedef struct {
 
 typedef struct {
     ListMode mode;
+    NearbyFilter filter;
     LinkStatus link;
     uint8_t count;
     uint8_t cursor;
@@ -154,6 +162,7 @@ typedef struct {
     VariableItemList* settings;
     Widget* about;
     ListMode list_mode;
+    NearbyFilter nearby_filter;
     uint32_t selected;
     // Device shown in the detail, name and alerts screens
     uint32_t detail_id;
@@ -186,13 +195,20 @@ static void list_scroll_to_cursor(DeviceListModel* model) {
 static void device_list_refresh(FlipperNinaApp* app) {
     DeviceListModel* model = view_get_model(app->device_list);
     model->mode = app->list_mode;
+    model->filter = app->nearby_filter;
     model->count = 0;
     furi_mutex_acquire(app->mutex, FuriWaitForever);
     model->link = app->link;
     for(uint8_t i = 0; i < MAX_DEVICES; i++) {
         const Device* dev = &app->devices[i];
         if(!dev->used) continue;
-        if(app->list_mode == ListFavorites ? !dev->favorite : !dev->visible) continue;
+        if(app->list_mode == ListNearby) {
+            if(!dev->visible) continue;
+            if(app->nearby_filter == FilterWifi && !dev->is_wifi) continue;
+            if(app->nearby_filter == FilterBle && dev->is_wifi) continue;
+        } else if(!dev->favorite) {
+            continue;
+        }
 
         ListEntry e;
         e.id = i;
@@ -247,6 +263,16 @@ static void device_list_draw(Canvas* canvas, void* _model) {
         snprintf(buf, sizeof(buf), "Nearby (%u)", model->count);
     }
     canvas_draw_str(canvas, 2, 10, buf);
+    if(model->mode == ListNearby) {
+        if(model->filter == FilterAll) {
+            canvas_draw_xbm(canvas, 110, 2, 7, 7, icon_wifi_7x7);
+            canvas_draw_xbm(canvas, 121, 1, 5, 9, icon_ble_5x9);
+        } else if(model->filter == FilterWifi) {
+            canvas_draw_xbm(canvas, 119, 2, 7, 7, icon_wifi_7x7);
+        } else {
+            canvas_draw_xbm(canvas, 121, 1, 5, 9, icon_ble_5x9);
+        }
+    }
     canvas_draw_line(canvas, 0, 11, 127, 11);
 
     canvas_set_font(canvas, FontSecondary);
@@ -298,6 +324,13 @@ static void detail_rebuild(FlipperNinaApp* app);
 static bool device_list_input(InputEvent* event, void* context) {
     FlipperNinaApp* app = context;
     if(event->key == InputKeyBack) return false;
+    if(event->key == InputKeyRight) {
+        if(event->type == InputTypeShort && app->list_mode == ListNearby) {
+            app->nearby_filter = (app->nearby_filter + 1) % FilterCount;
+            device_list_refresh(app);
+        }
+        return true;
+    }
     if(event->type != InputTypeShort && event->type != InputTypeRepeat) return false;
 
     bool open = false;
