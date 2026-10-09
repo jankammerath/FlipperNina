@@ -2,9 +2,9 @@
 // streams the results to the Flipper Zero over Serial1 (D0 = RX, D1 = TX).
 //
 // Protocol, one tab-separated line per record:
-//   B <addr> <rssi> <name> <vendor> <make> <model>   BLE device
-//   W <bssid> <rssi> <ssid> <security> <channel>     WiFi network
-//   E B | E W                                        end of a BLE / WiFi round
+//   B <addr> <rssi> <name> <vendor> <make> <model> <os>   BLE device, os = I (iOS), A (Android) or empty
+//   W <bssid> <rssi> <ssid> <security> <channel>          WiFi network
+//   E B | E W                                             end of a BLE / WiFi round
 
 #include <ArduinoBLE.h>
 #include <WiFiNINA.h>
@@ -30,6 +30,7 @@ struct Device {
   String vendor;
   String make;
   String model;
+  char os;
 };
 
 Device devices[MAX_DEVICES];
@@ -83,7 +84,45 @@ Device* findOrAdd(const String& address) {
   slot->vendor = "";
   slot->make = "";
   slot->model = "";
+  slot->os = 0;
   return slot;
+}
+
+// Google Nearby / Quick Share and Exposure Notification. Fast Pair (FE2C) is left
+// out because headphones advertise it, not phones.
+bool isAndroidUuid(uint16_t uuid) {
+  return uuid == 0xFEF3 || uuid == 0xFC12 || uuid == 0xFD6F;
+}
+
+// Guesses the phone OS from the raw advertisement: 'I' iOS, 'A' Android, 0 unknown.
+char detectPhoneOs(BLEDevice& peripheral) {
+  uint8_t adv[64];
+  int len = peripheral.advertisementData(adv, sizeof(adv));
+
+  for (int i = 0; i + 1 < len;) {
+    int fieldLen = adv[i];
+    if (fieldLen == 0 || i + 1 + fieldLen > len) break;
+    uint8_t type = adv[i + 1];
+    const uint8_t* data = &adv[i + 2];
+    int dataLen = fieldLen - 1;
+
+    // Apple manufacturer data; Continuity types from iPhones/iPads, not AirPods (0x07) or Find My tags (0x12).
+    if (type == 0xFF && dataLen >= 3 && data[0] == 0x4C && data[1] == 0x00) {
+      uint8_t appleType = data[2];
+      if (appleType == 0x10 || appleType == 0x0F || appleType == 0x0C || appleType == 0x05) return 'I';
+    }
+    // Complete/incomplete 16-bit service UUID lists
+    if (type == 0x02 || type == 0x03) {
+      for (int j = 0; j + 1 < dataLen; j += 2) {
+        if (isAndroidUuid(data[j] | (data[j + 1] << 8))) return 'A';
+      }
+    }
+    // 16-bit service data
+    if (type == 0x16 && dataLen >= 2 && isAndroidUuid(data[0] | (data[1] << 8))) return 'A';
+
+    i += 1 + fieldLen;
+  }
+  return 0;
 }
 
 String readStringChar(BLEDevice& peripheral, const char* uuid) {
@@ -110,6 +149,8 @@ void sendBle(const Device& d) {
   FLIPPER.print(d.make);
   FLIPPER.print('\t');
   FLIPPER.print(d.model);
+  FLIPPER.print('\t');
+  if (d.os) FLIPPER.print(d.os);
   FLIPPER.print('\n');
 }
 
@@ -163,6 +204,10 @@ void bleRound() {
     d->seen = true;
     d->lastSeen = millis();
     d->rssi = peripheral.rssi();
+
+    // Keep a detected OS; phones don't send the telltale data in every advertisement.
+    char os = detectPhoneOs(peripheral);
+    if (os) d->os = os;
 
     if (peripheral.hasLocalName()) {
       String name = clean(peripheral.localName());

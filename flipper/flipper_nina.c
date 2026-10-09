@@ -75,6 +75,7 @@ typedef enum {
 // XBM, LSB = leftmost pixel
 static const uint8_t icon_ble_5x9[] = {0x04, 0x0C, 0x15, 0x0E, 0x04, 0x0E, 0x15, 0x0C, 0x04};
 static const uint8_t icon_wifi_7x7[] = {0x3E, 0x41, 0x00, 0x1C, 0x22, 0x00, 0x08};
+static const uint8_t icon_phone_5x9[] = {0x1F, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1F, 0x1B, 0x1F};
 
 static const char* const on_off_text[] = {"Off", "On"};
 
@@ -123,6 +124,8 @@ typedef struct {
     char make[33];
     char model[33];
     char security[8];
+    // Phone OS reported by the Nina: 'I' iOS, 'A' Android, 0 unknown
+    char os;
     // User-given name of a favorite; overrides everything else
     char alias[ALIAS_LEN];
     char display[104];
@@ -131,6 +134,7 @@ typedef struct {
 typedef struct {
     uint8_t id;
     bool is_wifi;
+    bool is_phone;
     bool favorite;
     bool visible;
     int8_t rssi;
@@ -213,6 +217,7 @@ static void device_list_refresh(FlipperNinaApp* app) {
         ListEntry e;
         e.id = i;
         e.is_wifi = dev->is_wifi;
+        e.is_phone = dev->os != 0;
         e.favorite = dev->favorite;
         e.visible = dev->visible;
         e.rssi = dev->rssi;
@@ -298,6 +303,8 @@ static void device_list_draw(Canvas* canvas, void* _model) {
 
         if(e->is_wifi) {
             canvas_draw_xbm(canvas, 2, top + 3, 7, 7, icon_wifi_7x7);
+        } else if(e->is_phone) {
+            canvas_draw_xbm(canvas, 3, top + 2, 5, 9, icon_phone_5x9);
         } else {
             canvas_draw_xbm(canvas, 3, top + 2, 5, 9, icon_ble_5x9);
         }
@@ -384,6 +391,8 @@ static void device_update_display(Device* d) {
         copy_field(out, size, d->model);
     } else if(d->make[0]) {
         snprintf(out, size, "%s %s", d->make, short_addr);
+    } else if(d->os) {
+        snprintf(out, size, "%s %s", d->os == 'I' ? "iOS" : "Android", short_addr);
     } else if(d->vendor[0]) {
         snprintf(out, size, "%s %s", d->vendor, short_addr);
     } else {
@@ -466,6 +475,7 @@ static void handle_line(FlipperNinaApp* app, char* line) {
             copy_field(d->vendor, sizeof(d->vendor), f[4]);
             copy_field(d->make, sizeof(d->make), f[5]);
             copy_field(d->model, sizeof(d->model), f[6]);
+            if(n >= 8 && (f[7][0] == 'I' || f[7][0] == 'A')) d->os = f[7][0];
             device_update_display(d);
             device_mark_seen(app, d);
         }
@@ -630,7 +640,14 @@ static void detail_rebuild(FlipperNinaApp* app) {
         snprintf(line, sizeof(line), "Channel: %u", dev->channel);
         widget_add_string_element(app->detail, 0, 43, AlignLeft, AlignTop, FontSecondary, line);
     } else {
-        snprintf(line, sizeof(line), "Vendor: %s", dev->vendor[0] ? dev->vendor : "-");
+        snprintf(
+            line,
+            sizeof(line),
+            "Vendor: %s%s",
+            dev->vendor[0] ? dev->vendor : "-",
+            dev->os == 'I' ? " (iOS)" :
+            dev->os == 'A' ? " (Android)" :
+                             "");
         widget_add_string_element(app->detail, 0, 33, AlignLeft, AlignTop, FontSecondary, line);
         if(dev->make[0] || dev->model[0]) {
             snprintf(
