@@ -2,6 +2,11 @@
 
 [Flipper app](https://lab.flipper.net/apps) using [WiFiNINA](https://github.com/arduino-libraries/WiFiNINA) on the Arduino Nano RP2040 Connect to scan for BLE devices and WiFi networks. It keeps track of contacts on the flipper and also allows making the flipper beep when a device is nearby that is marked as a favorite.
 
+| ![Screenshot 1](/screenshots/screenshot1.png) | ![Screenshot 2](/screenshots/screenshot2.png) | ![Screenshot 3](/screenshots/screenshot3.png) |
+|---|---|---|
+| ![Screenshot 4](/screenshots/screenshot4.png) | ![Screenshot 2](/screenshots/screenshot5.png) | ![Screenshot 3](/screenshots/screenshot6.png) |
+| ![Screenshot 7](/screenshots/screenshot7.png) | ![Screenshot 8](/screenshots/screenshot8.png) | ![Screenshot 9](/screenshots/screenshot9.png) |
+
 # Installation
 
 ## Install flipper app
