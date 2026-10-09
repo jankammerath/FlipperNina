@@ -1,0 +1,12 @@
+App(
+    appid="flipper_nina",
+    name="FlipperNina",
+    apptype=FlipperAppType.EXTERNAL,
+    entry_point="flipper_nina_app",
+    stack_size=2 * 1024,
+    fap_category="GPIO",
+    fap_icon="assets/icon_10px.png",
+    fap_description="WiFi and BLE companion for Arduino Nano RP2040 Connect",
+    fap_author="Jan Kammerath",
+    fap_version="1.0",
+)
