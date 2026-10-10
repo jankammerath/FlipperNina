@@ -66,5 +66,6 @@ Notes:
 Perform the following command inside the `flipper` folder.
 
 ```sh
-./compile_rp2040.sh FlipperNina_Arduino.ino FlipperNina_RP2040.uf2
+./compile_rp2040.sh FlipperNina_ArduinoNanoRP2040.ino FlipperNina_RP2040.uf2
+./compile_nanoesp32.sh FlipperNina_ArduinoNanoESP32.ino ./dist/
 ```

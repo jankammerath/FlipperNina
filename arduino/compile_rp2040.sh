@@ -58,7 +58,10 @@ if [[ "$(basename "$SKETCH_SRC_DIR")" != "$SKETCH_NAME" ]]; then
   TEMP_STAGE_DIR="$(mktemp -d)"
   COMPILE_DIR="$TEMP_STAGE_DIR/$SKETCH_NAME"
   mkdir -p "$COMPILE_DIR"
-  cp -R "$SKETCH_SRC_DIR"/* "$COMPILE_DIR/" 2>/dev/null || true
+  # Copy helper sources but no other .ino files, which would be merged into this sketch.
+  find "$SKETCH_SRC_DIR" -maxdepth 1 -type f \
+    \( -name '*.h' -o -name '*.hpp' -o -name '*.c' -o -name '*.cpp' \) \
+    -exec cp {} "$COMPILE_DIR/" \;
   cp "$SKETCH_ABS" "$COMPILE_DIR/$SKETCH_FILE"
 else
   COMPILE_DIR="$SKETCH_SRC_DIR"
