@@ -9,13 +9,26 @@
 
 # Installation
 
-## Install flipper app
+## Easy installation
+
+The easiest way to install both applications is to use the precompiled `Release`.
+
+1. Install the `uf2` file from the release on your RP2040 by copying it onto the device
+2. Install the `fap` file using the qFlipper desktop application
+3. Connect the RP2040 to the flipper as described
+
+## Install flipper app manually
 
 To install and start it on a Flipper connected over USB, run this from the `flipper` folder:
 
 ```sh
 python3 -m ufbt launch
 ```
+
+## Install Arduino app manually
+
+You can compiled the Arduino app with the supplied bash script, or copy the `*.ino` file into the Arduino IDE. 
+
 
 # Building the Hardware Extension
 
