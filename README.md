@@ -46,3 +46,12 @@ Notes:
 - The app turns on the 5V output on pin 1 when it starts and turns it off when it exits.
 - The Arduino sketch must use `Serial1` (pins D0/D1) to talk to the Flipper. `Serial` is the USB port.
 
+# Compile
+
+## Compile for RP2040 Connect
+
+Perform the following command inside the `flipper` folder.
+
+```sh
+./compile_rp2040.sh FlipperNina_Arduino.ino FlipperNina_RP2040.uf2
+```
