@@ -59,11 +59,40 @@ Notes:
 - The app turns on the 5V output on pin 1 when it starts and turns it off when it exits.
 - The Arduino sketch must use `Serial1` (pins D0/D1) to talk to the Flipper. `Serial` is the USB port.
 
+## ESP32-NORA Wiring instructions
+
+The Arduino Nano ESP32 (u-blox NORA-W106 / ESP32-S3) is wired the same way as the RP2040 Connect: UART on D0/D1 and power from the Flipper's 5V GPIO pin. Both boards use 3.3V logic, so no level shifter is needed.
+
+| Flipper Zero GPIO pin | Function    | Nano ESP32 pin |
+|-----------------------|-------------|----------------|
+| 1                     | 5V          | VIN            |
+| 18 (or 8, 11)         | GND         | GND            |
+| 13                    | TX (USART1) | RX (D0)        |
+| 14                    | RX (USART1) | TX (D1)        |
+
+```
+ Flipper Zero                 Nano ESP32
+ ------------                 ----------
+ Pin 1  (5V)  --------------> VIN
+ Pin 18 (GND) --------------- GND
+ Pin 13 (TX)  --------------> D0 / RX
+ Pin 14 (RX)  <-------------- D1 / TX
+```
+
+Notes:
+
+- TX and RX are crossed: Flipper TX goes to Nano RX and vice versa.
+- The Nano ESP32 has no `+5V` input pin. Its `VBUS` pin only outputs USB 5V, so don't feed power into it.
+- Arduino recommends 6-21V on VIN, while the on-board MP2322 converter is specified from 5V. The Flipper's 5V on VIN is therefore at the lower limit; if the board browns out (e.g. resets during WiFi scans), power it over USB-C instead.
+- The app turns on the 5V output on pin 1 when it starts and turns it off when it exits.
+- The sketch uses `Serial0` (pins D0/D1) to talk to the Flipper. `Serial` is the USB port.
+- The ESP32 bootloader prints a few messages on `Serial0` at reset. The Flipper app ignores them because every line is checksummed.
+
 # Compile
 
 ## Compile for RP2040 Connect
 
-Perform the following command inside the `flipper` folder.
+Perform the following command inside the `arduino` folder.
 
 ```sh
 ./compile_rp2040.sh FlipperNina_ArduinoNanoRP2040.ino FlipperNina_RP2040.uf2
